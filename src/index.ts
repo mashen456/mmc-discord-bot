@@ -12,11 +12,19 @@ import {
     GuildMember,
     InteractionResponseType,
     ChannelType,
-    CategoryChannel
+    CategoryChannel,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ButtonInteraction,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle
 } from 'discord.js';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
+import { updatePasswordChannel, createWorkerRemovedEmbed } from './workers';
 
 dotenv.config();
 
@@ -25,6 +33,8 @@ interface UserRole {
     userId: string;
     roleId: string;
     assignedAt: string;
+    employerId?: string;
+    password?: string; // Neues Feld für das Passwort
 }
 
 interface ServerConfig {
@@ -34,6 +44,8 @@ interface ServerConfig {
     roleSelectionMessageId?: string;
     roleAssignmentLogChannelId?: string;
     roleErrorLogChannelId?: string;
+    workerInfoChannelId?: string;
+    workerPasswordChannelId?: string; // Neuer Kanal für Passwörter
     reactionRoles: Map<string, string>;
     userRoles: UserRole[]; // Server-spezifische Benutzer-Rollen
     familyChannels: {
@@ -53,6 +65,14 @@ interface ServerConfig {
     };
     commandRoles?: string[]; // IDs der Rollen, die Befehle ausführen dürfen
     infoChannels?: string[]; // IDs der Info-Kanäle
+    pendingWorkerApplications?: {
+        workerId: string;
+        employerId: string;
+        roleId: string;
+        appliedAt: string;
+    }[];
+    routeControlChannelId?: string;
+    routeControlLogChannelId?: string;
 }
 
 interface Database {
@@ -126,6 +146,10 @@ const client = new Client({
         GatewayIntentBits.GuildMessageReactions
     ]
 });
+
+// Konstanten für die Arbeiter-Rolle
+const WORKER_ROLE_NAME = 'Arbeiter';
+const WORKER_EMOJI = '👷';
 
 // Slash Commands definieren
 const commands = [
@@ -260,7 +284,54 @@ const commands = [
     new SlashCommandBuilder()
         .setName('info-kanäle-liste')
         .setDescription('Zeigt alle Info-Kanäle an'),
-].map(command => command.toJSON());
+    new SlashCommandBuilder()
+        .setName('arbeiter-info-kanal-setzen')
+        .setDescription('Setzt den Kanal für Arbeiter-Informationen')
+        .addChannelOption(option =>
+            option.setName('kanal')
+                .setDescription('Der Kanal für Arbeiter-Informationen')
+                .setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('arbeiter-entfernen')
+        .setDescription('Entfernt einen Arbeiter')
+        .addUserOption(option =>
+            option.setName('arbeiter')
+                .setDescription('Der Arbeiter, der entfernt werden soll')
+                .setRequired(true))
+        .toJSON(),
+    new SlashCommandBuilder()
+        .setName('arbeiter-passwort-kanal-setzen')
+        .setDescription('Setzt den Kanal für Arbeiter-Passwörter')
+        .addChannelOption(option =>
+            option.setName('kanal')
+                .setDescription('Der Kanal für Arbeiter-Passwörter')
+                .setRequired(true))
+        .toJSON(),
+    new SlashCommandBuilder()
+        .setName('benutzer-entfernen')
+        .setDescription('Entfernt einen Benutzer aus der Datenbank (Admin only)')
+        .addUserOption(option =>
+            option.setName('benutzer')
+                .setDescription('Der Benutzer, der aus der Datenbank entfernt werden soll')
+                .setRequired(true))
+        .toJSON(),
+    new SlashCommandBuilder()
+        .setName('route-kontrolle-setzen')
+        .setDescription('Setzt den Kanal für das Routen-Kontroll-Menü')
+        .addChannelOption(option =>
+            option.setName('kanal')
+                .setDescription('Der Kanal für das Routen-Kontroll-Menü')
+                .setRequired(true))
+        .toJSON(),
+    new SlashCommandBuilder()
+        .setName('route-log-setzen')
+        .setDescription('Setzt den Kanal für die Routen-Kontroll-Logs')
+        .addChannelOption(option =>
+            option.setName('kanal')
+                .setDescription('Der Kanal für die Routen-Kontroll-Logs')
+                .setRequired(true))
+        .toJSON(),
+];
 
 // Funktion zum Registrieren der Slash Commands
 async function registerCommands() {
@@ -356,34 +427,14 @@ client.once('ready', async () => {
                     try {
                         const message = await channel.messages.fetch(serverConfig.roleSelectionMessageId);
                         
-                        // Bearbeite die bestehende Nachricht
-                        const embed = new EmbedBuilder()
-                            .setTitle('🎭 Rollen-Auswahl')
-                            .setDescription('Klicke auf eine der Reaktionen unten, um dir eine Rolle zuzuweisen.\n' +
-                                'Du kannst nur eine Rolle gleichzeitig haben.\n' +
-                                '**Wichtig:** Einmal zugewiesene Rollen können nicht mehr entfernt werden!\n\n' +
-                                '**Verfügbare Rollen:**\n' +
-                                Array.from(serverConfig.reactionRoles.entries())
-                                    .map(([emoji, roleId]) => {
-                                        const role = guild.roles.cache.get(roleId);
-                                        return `${emoji} - ${role?.name || 'Unbekannte Rolle'}`;
-                                    })
-                                    .join('\n'))
-                            .setColor('#0099ff')
-                            .setFooter({ text: 'Wähle deine Rolle mit Bedacht - sie kann nicht mehr entfernt werden!' });
-
-                        await message.edit({ embeds: [embed] });
+                        // Erstelle die Rollen-Auswahl-Nachricht mit Buttons
+                        const { embed, rows } = await createRoleSelectionMessage(channel, serverConfig);
                         
-                        // Entferne alte Reaktionen
-                        const reactions = message.reactions.cache;
-                        for (const reaction of reactions.values()) {
-                            await reaction.remove();
-                        }
-
-                        // Füge neue Reaktionen hinzu
-                        for (const emoji of serverConfig.reactionRoles.keys()) {
-                            await message.react(emoji);
-                        }
+                        // Bearbeite die bestehende Nachricht
+                        await message.edit({ 
+                            embeds: [embed],
+                            components: rows
+                        });
                     } catch (error) {
                         console.error(`Fehler beim Aktualisieren der Nachricht für Server ${guildId}:`, error);
                     }
@@ -401,143 +452,6 @@ client.once('ready', async () => {
         }],
         status: 'online'
     });
-});
-
-// Event für neue Reaktionen
-client.on('messageReactionAdd', async (reaction, user) => {
-    if (user.bot) return;
-    
-    // Erstelle die vollständige Emoji-Notation
-    const emojiIdentifier = reaction.emoji.id && reaction.emoji.name ? 
-        `<:${reaction.emoji.name}:${reaction.emoji.id}>` : 
-        (reaction.emoji.name || '');
-    
-    console.log('Reaktion hinzugefügt:', emojiIdentifier);
-    
-    if (reaction.partial) {
-        try {
-            await reaction.fetch();
-        } catch (error) {
-            console.error('Fehler beim Laden der Reaktion:', error);
-            return;
-        }
-    }
-
-    const guild = reaction.message.guild;
-    if (!guild) {
-        console.log('Keine Guild gefunden');
-        return;
-    }
-
-    const serverConfig = getServerConfig(guild.id);
-    console.log('Server Config:', serverConfig);
-    console.log('Reaction Roles:', Array.from(serverConfig.reactionRoles.entries()));
-    
-    // Suche nach der Rolle mit der vollständigen Emoji-Notation
-    const roleId = serverConfig.reactionRoles.get(emojiIdentifier);
-    console.log('Gefundene Role ID:', roleId);
-    
-    if (!roleId) {
-        console.log('Keine passende Rolle gefunden für Emoji:', emojiIdentifier);
-        return;
-    }
-
-    try {
-        const member = await guild.members.fetch(user.id);
-        const role = guild.roles.cache.get(roleId);
-        const botMember = await guild.members.fetch(client.user!.id);
-
-        console.log('Member:', member.user.tag);
-        console.log('Role:', role?.name);
-        console.log('Bot Member:', botMember.user.tag);
-
-        if (!role) {
-            console.log('Rolle nicht gefunden');
-            return;
-        }
-
-        // Prüfe, ob der Benutzer bereits eine Rolle hat
-        const existingRole = serverConfig.userRoles.find(ur => ur.userId === user.id);
-        if (existingRole) {
-            console.log('Benutzer hat bereits eine Rolle:', existingRole.roleId);
-            await reaction.users.remove(user.id);
-            
-            // Logge den Versuch einer doppelten Rollenauswahl
-            if (serverConfig.roleErrorLogChannelId) {
-                const errorLogChannel = guild.channels.cache.get(serverConfig.roleErrorLogChannelId) as TextChannel;
-                if (errorLogChannel) {
-                    const errorEmbed = new EmbedBuilder()
-                        .setTitle('⚠️ Doppelte Rollenauswahl')
-                        .setDescription(`${user.tag} hat versucht, eine weitere Rolle auszuwählen`)
-                        .addFields(
-                            { name: 'Benutzer ID', value: user.id },
-                            { name: 'Bereits zugewiesene Rolle', value: `<@&${existingRole.roleId}>` },
-                            { name: 'Gewünschte Rolle', value: `<@&${role.id}>` }
-                        )
-                        .setColor('#ff0000')
-                        .setTimestamp();
-
-                    await errorLogChannel.send({ embeds: [errorEmbed] });
-                }
-            }
-            return;
-        }
-
-        // Prüfe Bot-Berechtigungen
-        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) {
-            console.error('Bot hat keine Berechtigung zum Verwalten von Rollen');
-            return;
-        }
-
-        // Prüfe, ob die Bot-Rolle höher ist als die zu verwaltende Rolle
-        if (botMember.roles.highest.position <= role.position) {
-            console.error('Bot-Rolle ist nicht hoch genug, um diese Rolle zu verwalten');
-            return;
-        }
-
-        console.log('Entferne alte Rollen...');
-        // Entferne alle anderen Reaktions-Rollen
-        for (const [_, existingRoleId] of serverConfig.reactionRoles) {
-            const existingRole = guild.roles.cache.get(existingRoleId);
-            if (existingRole && member.roles.cache.has(existingRoleId)) {
-                await member.roles.remove(existingRole);
-            }
-        }
-        
-        console.log('Füge neue Rolle hinzu...');
-        // Füge die neue Rolle hinzu
-        await member.roles.add(role);
-        
-        // Speichere die Rolle in der Datenbank
-        serverConfig.userRoles.push({
-            userId: user.id,
-            roleId: role.id,
-            assignedAt: new Date().toISOString()
-        });
-        saveDatabase(database);
-        
-        console.log(`Rolle ${role.name} wurde ${user.tag} zugewiesen`);
-
-        // Logge die erfolgreiche Rollenvergabe
-        if (serverConfig.roleAssignmentLogChannelId) {
-            const logChannel = guild.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
-            if (logChannel) {
-                const logEmbed = new EmbedBuilder()
-                    .setTitle('✅ Rolle zugewiesen')
-                    .setDescription(`${user.tag} hat sich eine Rolle zugewiesen`)
-                    .addFields(
-                        { name: 'Benutzer ID', value: user.id },
-                        { name: 'Zugewiesene Rolle', value: `<@&${role.id}>` }
-                    )
-                    .setColor('#00ff00')
-                    .setTimestamp();
-
-                await logChannel.send({ embeds: [logEmbed] });
-            }
-        }
-    } catch (error) {
-        console.error('Fehler beim Zuweisen der Rolle:', error);
-    }
 });
 
 // Event für Server-Beitritt
@@ -637,6 +551,92 @@ async function updateReactionMessage(channel: TextChannel) {
     }
 }
 
+// Funktion zum Erstellen der Arbeiter-Rolle
+async function createWorkerRole(guild: any) {
+    try {
+        // Prüfe, ob die Rolle bereits existiert
+        let workerRole = guild.roles.cache.find((role: any) => role.name === WORKER_ROLE_NAME);
+        
+        if (!workerRole) {
+            // Erstelle die Rolle, falls sie nicht existiert
+            workerRole = await guild.roles.create({
+                name: WORKER_ROLE_NAME,
+                color: '#FFA500', // Orange Farbe
+                reason: 'Automatische Erstellung der Arbeiter-Rolle'
+            });
+            console.log(`Arbeiter-Rolle wurde erstellt: ${workerRole.name}`);
+        }
+
+        // Füge die Rolle zur Datenbank hinzu
+        const serverConfig = getServerConfig(guild.id);
+        serverConfig.reactionRoles.set(WORKER_EMOJI, workerRole.id);
+        saveDatabase(database);
+
+        return workerRole;
+    } catch (error) {
+        console.error('Fehler beim Erstellen der Arbeiter-Rolle:', error);
+        return null;
+    }
+}
+
+// Funktion zum Erstellen der Rollen-Auswahl-Nachricht
+async function createRoleSelectionMessage(channel: TextChannel, serverConfig: ServerConfig) {
+    const embed = new EmbedBuilder()
+        .setTitle('🎭 Rollen-Auswahl')
+        .setDescription('Klicke auf einen der Buttons unten, um dir eine Rolle zuzuweisen.\n' +
+            'Du kannst nur eine Rolle gleichzeitig haben.\n' +
+            '**Wichtig:** Einmal zugewiesene Rollen können nicht mehr entfernt werden!')
+        .setColor('#0099ff')
+        .setFooter({ text: 'Wähle deine Rolle mit Bedacht - sie kann nicht mehr entfernt werden!' });
+
+    // Erstelle Buttons für jede Rolle
+    const rows: ActionRowBuilder<ButtonBuilder>[] = [];
+    let currentRow = new ActionRowBuilder<ButtonBuilder>();
+    let buttonCount = 0;
+
+    // Füge zuerst den Arbeiter-Button hinzu
+    const workerRole = channel.guild.roles.cache.find(role => role.name === WORKER_ROLE_NAME);
+    if (workerRole) {
+        currentRow.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`role_${workerRole.id}`)
+                .setLabel('Arbeiter')
+                .setEmoji(WORKER_EMOJI)
+                .setStyle(ButtonStyle.Primary)
+        );
+        buttonCount++;
+    }
+
+    // Füge dann die restlichen Rollen hinzu
+    for (const [emoji, roleId] of serverConfig.reactionRoles) {
+        if (emoji === WORKER_EMOJI) continue; // Überspringe die Arbeiter-Rolle, da sie bereits hinzugefügt wurde
+
+        const role = channel.guild.roles.cache.get(roleId);
+        if (role) {
+            if (buttonCount === 5) {
+                rows.push(currentRow);
+                currentRow = new ActionRowBuilder<ButtonBuilder>();
+                buttonCount = 0;
+            }
+
+            currentRow.addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`role_${role.id}`)
+                    .setLabel(role.name)
+                    .setEmoji(emoji)
+                    .setStyle(ButtonStyle.Primary)
+            );
+            buttonCount++;
+        }
+    }
+
+    if (buttonCount > 0) {
+        rows.push(currentRow);
+    }
+
+    return { embed, rows };
+}
+
 // Slash Command Handler
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
@@ -670,28 +670,20 @@ client.on('interactionCreate', async (interaction) => {
                 return;
             }
 
-            const embed = new EmbedBuilder()
-                .setTitle('🎭 Rollen-Auswahl')
-                .setDescription('Klicke auf eine der Reaktionen unten, um dir eine Rolle zuzuweisen.\n' +
-                    'Du kannst nur eine Rolle gleichzeitig haben.\n' +
-                    '**Wichtig:** Einmal zugewiesene Rollen können nicht mehr entfernt werden!')
-                .setColor('#0099ff')
-                .setFooter({ text: 'Wähle deine Rolle mit Bedacht - sie kann nicht mehr entfernt werden!' });
-
-            const roleMessage = await interaction.channel.send({ embeds: [embed] });
+            // Erstelle die Arbeiter-Rolle
+            const createdWorkerRole = await createWorkerRole(interaction.guild);
+            
+            // Erstelle die Rollen-Auswahl-Nachricht mit Buttons
+            const { embed, rows } = await createRoleSelectionMessage(interaction.channel, serverConfig);
+            
+            const roleMessage = await interaction.channel.send({ 
+                embeds: [embed],
+                components: rows
+            });
             
             serverConfig.roleSelectionMessageId = roleMessage.id;
             serverConfig.roleSelectionChannelId = interaction.channel.id;
             saveDatabase(database);
-            
-            // Sende für jede Rolle eine separate Nachricht
-            for (const [emoji, roleId] of serverConfig.reactionRoles) {
-                const role = interaction.guild?.roles.cache.get(roleId);
-                if (role) {
-                    await interaction.channel.send(`${emoji} - ${role.name}`);
-                    await roleMessage.react(emoji);
-                }
-            }
 
             await interaction.reply({ 
                 content: 'Rollen-Auswahl wurde erstellt!', 
@@ -1570,7 +1562,1158 @@ client.on('interactionCreate', async (interaction) => {
                 flags: 64
             });
             break;
+
+        case 'arbeiter-info-kanal-setzen':
+            const workerInfoChannel = interaction.options.getChannel('kanal', true);
+            if (!(workerInfoChannel instanceof TextChannel)) {
+                await interaction.reply({
+                    content: 'Der ausgewählte Kanal muss ein Textkanal sein!',
+                    flags: 64
+                });
+                return;
+            }
+
+            serverConfig.workerInfoChannelId = workerInfoChannel.id;
+            saveDatabase(database);
+
+            // Erstelle eine Willkommensnachricht im neuen Kanal
+            const workerInfoEmbed = new EmbedBuilder()
+                .setTitle('👷 Arbeiter-Informationen')
+                .setDescription('In diesem Kanal werden wichtige Informationen für Arbeiter geteilt.\n' +
+                    'Hier findest du:\n' +
+                    '• Passwörter für Routen\n' +
+                    '• Wichtige Ankündigungen\n' +
+                    '• Andere relevante Informationen')
+                .setColor('#FFA500')
+                .setTimestamp();
+
+            await workerInfoChannel.send({ embeds: [workerInfoEmbed] });
+
+            // Setze die Berechtigungen für den Kanal
+            const workerRoleForChannel = interaction.guild?.roles.cache.find(role => role.name === WORKER_ROLE_NAME);
+            if (workerRoleForChannel) {
+                await workerInfoChannel.permissionOverwrites.create(workerRoleForChannel, {
+                    ViewChannel: true,
+                    ReadMessageHistory: true
+                });
+            }
+
+            await interaction.reply({
+                content: `Der Arbeiter-Info-Kanal wurde auf ${workerInfoChannel} gesetzt!`,
+                flags: 64
+            });
+            break;
+
+        case 'arbeiter-entfernen':
+            const workerToRemove = interaction.options.getUser('arbeiter', true);
+            const workerMember = await interaction.guild?.members.fetch(workerToRemove.id);
+            const existingWorkerRole = interaction.guild?.roles.cache.find(r => r.name === WORKER_ROLE_NAME);
+
+            if (!workerMember || !existingWorkerRole) {
+                await interaction.reply({
+                    content: 'Der Arbeiter oder die Arbeiter-Rolle wurde nicht gefunden!',
+                    flags: 64
+                });
+                return;
+            }
+
+            if (!workerMember.roles.cache.has(existingWorkerRole.id)) {
+                await interaction.reply({
+                    content: 'Dieser Benutzer ist kein Arbeiter!',
+                    flags: 64
+                });
+                return;
+            }
+
+            try {
+                // Entferne die Rolle
+                await workerMember.roles.remove(existingWorkerRole);
+                
+                // Entferne die Rolle aus der Datenbank
+                serverConfig.userRoles = serverConfig.userRoles.filter(ur => ur.userId !== workerMember.id);
+                saveDatabase(database);
+
+                // Logge das Entfernen der Rolle
+                if (serverConfig.roleAssignmentLogChannelId) {
+                    const logChannel = interaction.guild?.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+                    if (logChannel) {
+                        const logEmbed = new EmbedBuilder()
+                            .setTitle('👋 Arbeiter entfernt')
+                            .setDescription(`${workerMember.user.tag} wurde als Arbeiter entfernt`)
+                            .addFields(
+                                { name: 'Arbeiter', value: workerMember.user.tag },
+                                { name: 'Chef', value: interaction.user.tag },
+                                { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                            )
+                            .setColor('#ff9900')
+                            .setTimestamp();
+
+                        await logChannel.send({ embeds: [logEmbed] });
+                    }
+                }
+
+                // Benachrichtige den Arbeiter
+                await workerMember.send(`Du wurdest von ${interaction.user.tag} als Arbeiter entfernt.`).catch(() => {});
+
+                await interaction.reply({
+                    content: `${workerMember.user.tag} wurde als Arbeiter entfernt.`,
+                    flags: 64
+                });
+            } catch (error) {
+                console.error('Fehler beim Entfernen des Arbeiters:', error);
+                await interaction.reply({
+                    content: 'Es ist ein Fehler beim Entfernen des Arbeiters aufgetreten!',
+                    flags: 64
+                });
+            }
+            break;
+
+        case 'arbeiter-passwort-kanal-setzen':
+            const workerPasswordChannel = interaction.options.getChannel('kanal', true);
+            if (!(workerPasswordChannel instanceof TextChannel)) {
+                await interaction.reply({
+                    content: 'Der ausgewählte Kanal muss ein Textkanal sein!',
+                    flags: 64
+                });
+                return;
+            }
+
+            serverConfig.workerPasswordChannelId = workerPasswordChannel.id;
+            saveDatabase(database);
+
+            // Erstelle eine Willkommensnachricht im neuen Kanal
+            const workerPasswordEmbed = new EmbedBuilder()
+                .setTitle('🔑 Arbeiter-Passwörter')
+                .setDescription('In diesem Kanal werden die Passwörter der Arbeiter angezeigt.\n' +
+                    'Hier findest du eine übersichtliche Liste aller Arbeiter und ihrer Passwörter.')
+                .setColor('#FFA500')
+                .setTimestamp();
+
+            await workerPasswordChannel.send({ embeds: [workerPasswordEmbed] });
+
+            // Setze die Berechtigungen für den Kanal
+            const workerRoleForPasswordChannel = interaction.guild?.roles.cache.find(role => role.name === WORKER_ROLE_NAME);
+            if (workerRoleForPasswordChannel) {
+                await workerPasswordChannel.permissionOverwrites.create(workerRoleForPasswordChannel, {
+                    ViewChannel: true,
+                    ReadMessageHistory: true
+                });
+            }
+
+            await interaction.reply({
+                content: `Der Arbeiter-Passwort-Kanal wurde auf ${workerPasswordChannel} gesetzt!`,
+                flags: 64
+            });
+            break;
+
+        case 'benutzer-entfernen':
+            // Sofortige Antwort auf die Interaktion
+            await interaction.deferReply({ ephemeral: true });
+
+            // Prüfe Admin-Berechtigung
+            if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
+                await interaction.editReply({
+                    content: 'Du hast keine Berechtigung für diesen Befehl!'
+                });
+                return;
+            }
+
+            const userToRemove = interaction.options.getUser('benutzer', true);
+            const userMember = await interaction.guild?.members.fetch(userToRemove.id);
+
+            if (!userMember) {
+                await interaction.editReply({
+                    content: 'Der angegebene Benutzer wurde nicht gefunden!'
+                });
+                return;
+            }
+
+            try {
+                // Entferne alle Rollen des Benutzers aus der Datenbank
+                const removedRoles = serverConfig.userRoles.filter(ur => ur.userId === userToRemove.id);
+                serverConfig.userRoles = serverConfig.userRoles.filter(ur => ur.userId !== userToRemove.id);
+
+                // Entferne ausstehende Bewerbungen
+                if (serverConfig.pendingWorkerApplications) {
+                    serverConfig.pendingWorkerApplications = serverConfig.pendingWorkerApplications.filter(
+                        app => app.workerId !== userToRemove.id && app.employerId !== userToRemove.id
+                    );
+                }
+
+                saveDatabase(database);
+
+                // Logge das Entfernen
+                if (serverConfig.roleAssignmentLogChannelId) {
+                    const logChannel = interaction.guild?.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+                    if (logChannel) {
+                        const logEmbed = new EmbedBuilder()
+                            .setTitle('🗑️ Benutzer aus Datenbank entfernt')
+                            .setDescription(`<@${userToRemove.id}> wurde aus der Datenbank entfernt`)
+                            .addFields(
+                                { name: 'Benutzer', value: `<@${userToRemove.id}>` },
+                                { name: 'Entfernt von', value: `<@${interaction.user.id}>` },
+                                { name: 'Entfernte Rollen', value: removedRoles.length > 0 
+                                    ? removedRoles.map(ur => `<@&${ur.roleId}>`).join(', ') 
+                                    : 'Keine' },
+                                { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                            )
+                            .setColor('#ff0000')
+                            .setTimestamp();
+
+                        await logChannel.send({ embeds: [logEmbed] });
+                    }
+                }
+
+                // Aktualisiere den Passwort-Kanal, falls vorhanden
+                if (serverConfig.workerPasswordChannelId) {
+                    const passwordChannel = interaction.guild?.channels.cache.get(serverConfig.workerPasswordChannelId) as TextChannel;
+                    if (passwordChannel) {
+                        const workersWithPasswords = serverConfig.userRoles
+                            .filter(ur => ur.employerId)
+                            .map(async ur => {
+                                const workerMember = await interaction.guild?.members.fetch(ur.userId).catch(() => null);
+                                const employerMember = await interaction.guild?.members.fetch(ur.employerId!).catch(() => null);
+                                return {
+                                    worker: workerMember,
+                                    employer: employerMember,
+                                    assignedAt: ur.assignedAt
+                                };
+                            });
+
+                        const workers = await Promise.all(workersWithPasswords);
+
+                        const passwordEmbed = new EmbedBuilder()
+                            .setTitle('🔑 Arbeiter-Passwörter')
+                            .setDescription('Hier sind alle Arbeiter und ihre Passwörter:')
+                            .addFields(
+                                {
+                                    name: 'Arbeiter',
+                                    value: workers.map((w, index) => {
+                                        const workerRole = serverConfig.userRoles.find(ur => ur.userId === w.worker?.id);
+                                        return `${w.worker?.displayName || 'Unbekannt'}: ${workerRole?.password || 'Kein Passwort gesetzt'}`;
+                                    }).join('\n'),
+                                    inline: false
+                                }
+                            )
+                            .setColor('#FFA500')
+                            .setTimestamp();
+
+                        // Lösche alte Nachrichten
+                        const messages = await passwordChannel.messages.fetch({ limit: 10 });
+                        await Promise.all(messages.map(msg => msg.delete()));
+
+                        await passwordChannel.send({ embeds: [passwordEmbed] });
+                    }
+                }
+
+                await interaction.editReply({
+                    content: `Der Benutzer <@${userToRemove.id}> wurde erfolgreich aus der Datenbank entfernt!`
+                });
+            } catch (error) {
+                console.error('Fehler beim Entfernen des Benutzers:', error);
+                await interaction.editReply({
+                    content: 'Es ist ein Fehler beim Entfernen des Benutzers aufgetreten!'
+                });
+            }
+            break;
+
+        case 'route-kontrolle-setzen':
+            const routeControlChannel = interaction.options.getChannel('kanal', true);
+            if (!(routeControlChannel instanceof TextChannel)) {
+                await interaction.reply({
+                    content: 'Der ausgewählte Kanal muss ein Textkanal sein!',
+                    flags: 64
+                });
+                return;
+            }
+
+            serverConfig.routeControlChannelId = routeControlChannel.id;
+            saveDatabase(database);
+
+            // Erstelle das Routen-Kontroll-Menü
+            const { createRouteControlMenu } = await import('./routeControl');
+            await createRouteControlMenu(routeControlChannel, serverConfig);
+
+            await interaction.reply({
+                content: `Der Routen-Kontroll-Kanal wurde auf ${routeControlChannel} gesetzt!`,
+                flags: 64
+            });
+            break;
+
+        case 'route-log-setzen':
+            const routeControlLogChannel = interaction.options.getChannel('kanal', true);
+            if (!(routeControlLogChannel instanceof TextChannel)) {
+                await interaction.reply({
+                    content: 'Der ausgewählte Kanal muss ein Textkanal sein!',
+                    flags: 64
+                });
+                return;
+            }
+
+            serverConfig.routeControlLogChannelId = routeControlLogChannel.id;
+            saveDatabase(database);
+
+            // Erstelle eine Willkommensnachricht im neuen Kanal
+            const routeControlLogEmbed = new EmbedBuilder()
+                .setTitle('🚦 Routen-Kontroll-Logs')
+                .setDescription('In diesem Kanal werden alle Routen-Kontrollen protokolliert.')
+                .setColor('#0099ff')
+                .setTimestamp();
+
+            await routeControlLogChannel.send({ embeds: [routeControlLogEmbed] });
+
+            await interaction.reply({
+                content: `Der Routen-Kontroll-Log-Kanal wurde auf ${routeControlLogChannel} gesetzt!`,
+                flags: 64
+            });
+            break;
     }
+});
+
+// Button Interaction Handler
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('role_')) return;
+
+    const roleId = customId.replace('role_', '');
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+    const member = interaction.member as GuildMember;
+    const role = guild.roles.cache.get(roleId);
+
+    if (!role) {
+        await interaction.reply({
+            content: 'Diese Rolle existiert nicht mehr!',
+            flags: 64
+        });
+        return;
+    }
+
+    try {
+        // Prüfe, ob der Benutzer bereits eine Rolle hat
+        const existingRole = serverConfig.userRoles.find(ur => ur.userId === member.id);
+        if (existingRole) {
+            await interaction.reply({
+                content: 'Du hast bereits eine Rolle! Diese kann nicht mehr entfernt werden.',
+                flags: 64
+            });
+            return;
+        }
+
+        // Wenn es sich um die Arbeiter-Rolle handelt, zeige den Modal
+        if (role.name === WORKER_ROLE_NAME) {
+            const modal = new ModalBuilder()
+                .setCustomId(`worker_modal_${role.id}`)
+                .setTitle('Arbeiter-Anmeldung');
+
+            const employerInput = new TextInputBuilder()
+                .setCustomId('employer')
+                .setLabel('Wessen Arbeiter möchtest du sein?')
+                .setPlaceholder('Gib den Namen deines zukünftigen Chefs ein')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true);
+
+            const firstActionRow = new ActionRowBuilder<TextInputBuilder>().addComponents(employerInput);
+            modal.addComponents(firstActionRow);
+
+            await interaction.showModal(modal);
+            return;
+        }
+
+        // Für andere Rollen: Direkte Zuweisung
+        await member.roles.add(role);
+        
+        // Speichere die Rolle in der Datenbank
+        serverConfig.userRoles.push({
+            userId: member.id,
+            roleId: role.id,
+            assignedAt: new Date().toISOString()
+        });
+        saveDatabase(database);
+
+        // Logge die erfolgreiche Rollenvergabe
+        if (serverConfig.roleAssignmentLogChannelId) {
+            const logChannel = guild.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+            if (logChannel) {
+                const logEmbed = new EmbedBuilder()
+                    .setTitle('✅ Rolle zugewiesen')
+                    .setDescription(`${member.user.tag} hat sich eine Rolle zugewiesen`)
+                    .addFields(
+                        { name: 'Benutzer ID', value: member.id },
+                        { name: 'Zugewiesene Rolle', value: `<@&${role.id}>` }
+                    )
+                    .setColor('#00ff00')
+                    .setTimestamp();
+
+                await logChannel.send({ embeds: [logEmbed] });
+            }
+        }
+
+        await interaction.reply({
+            content: `Du hast die Rolle ${role} erhalten!`,
+            flags: 64
+        });
+    } catch (error) {
+        console.error('Fehler beim Zuweisen der Rolle:', error);
+        await interaction.reply({
+            content: 'Es ist ein Fehler beim Zuweisen der Rolle aufgetreten!',
+            flags: 64
+        });
+    }
+});
+
+// Modal Submit Handler
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('worker_modal_')) return;
+
+    const roleId = customId.replace('worker_modal_', '');
+    const guild = interaction.guild;
+    if (!guild) {
+        await interaction.reply({
+            content: 'Dieser Befehl kann nur in einem Server verwendet werden!',
+            flags: 64
+        });
+        return;
+    }
+
+    // Sofortige Antwort auf die Interaktion
+    await interaction.deferReply({ ephemeral: true });
+
+    const serverConfig = getServerConfig(guild.id);
+    const member = interaction.member as GuildMember;
+    const role = guild.roles.cache.get(roleId);
+
+    if (!role) {
+        await interaction.editReply({
+            content: 'Diese Rolle existiert nicht mehr!'
+        });
+        return;
+    }
+
+    try {
+        const employerInput = interaction.fields.getTextInputValue('employer');
+        
+        // Versuche den Arbeitgeber zu finden
+        let employer = null;
+        
+        // Suche nach ID
+        if (employerInput.match(/^\d+$/)) {
+            try {
+                employer = await guild.members.fetch(employerInput);
+            } catch (error) {
+                console.error('Fehler beim Abrufen des Mitglieds:', error);
+            }
+        }
+        
+        // Suche nach Username
+        if (!employer) {
+            try {
+                // Suche nach exaktem Match
+                const exactMatch = guild.members.cache.find(m => 
+                    m.user.username.toLowerCase() === employerInput.toLowerCase() ||
+                    m.displayName.toLowerCase() === employerInput.toLowerCase()
+                );
+                
+                if (exactMatch) {
+                    employer = exactMatch;
+                } else {
+                    // Suche nach Teilübereinstimmung
+                    const partialMatch = guild.members.cache.find(m => 
+                        m.user.username.toLowerCase().includes(employerInput.toLowerCase()) ||
+                        m.displayName.toLowerCase().includes(employerInput.toLowerCase())
+                    );
+                    
+                    if (partialMatch) {
+                        employer = partialMatch;
+                    }
+                }
+            } catch (error) {
+                console.error('Fehler beim Suchen des Mitglieds:', error);
+            }
+        }
+
+        if (!employer) {
+            await interaction.editReply({
+                content: 'Der angegebene Arbeitgeber wurde nicht gefunden! Bitte versuche es erneut.'
+            });
+            return;
+        }
+
+        // Prüfe, ob der Bewerber nicht der Arbeitgeber selbst ist
+        if (employer.id === member.id) {
+            await interaction.editReply({
+                content: 'Du kannst nicht dein eigener Arbeiter sein!'
+            });
+            return;
+        }
+
+        // Speichere die Bewerbung in der Datenbank
+        if (!serverConfig.pendingWorkerApplications) {
+            serverConfig.pendingWorkerApplications = [];
+        }
+        
+        serverConfig.pendingWorkerApplications.push({
+            workerId: member.id,
+            employerId: employer.id,
+            roleId: role.id,
+            appliedAt: new Date().toISOString()
+        });
+        saveDatabase(database);
+
+        // Sende eine Nachricht in den Arbeiter-Info-Kanal
+        if (serverConfig.workerInfoChannelId) {
+            const workerInfoChannel = guild.channels.cache.get(serverConfig.workerInfoChannelId) as TextChannel;
+            if (workerInfoChannel) {
+                const workerInfoEmbed = new EmbedBuilder()
+                    .setTitle('👷 Neuer Arbeiter-Bewerber')
+                    .setDescription(`<@${member.id}> möchte Arbeiter von <@${employer.id}> werden`)
+                    .addFields(
+                        { name: 'Bewerber', value: `<@${member.id}>` },
+                        { name: 'Zukünftiger Chef', value: `<@${employer.id}>` },
+                        { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                    )
+                    .setColor('#FFA500')
+                    .setTimestamp();
+
+                const acceptButton = new ButtonBuilder()
+                    .setCustomId(`accept_worker_${member.id}_${role.id}_${employer.id}`)
+                    .setLabel('Annehmen')
+                    .setStyle(ButtonStyle.Success)
+                    .setEmoji('✅');
+
+                const rejectButton = new ButtonBuilder()
+                    .setCustomId(`reject_worker_${member.id}_${role.id}_${employer.id}`)
+                    .setLabel('Ablehnen')
+                    .setStyle(ButtonStyle.Danger)
+                    .setEmoji('❌');
+
+                const row = new ActionRowBuilder<ButtonBuilder>()
+                    .addComponents(acceptButton, rejectButton);
+
+                await workerInfoChannel.send({ 
+                    embeds: [workerInfoEmbed],
+                    components: [row]
+                });
+            }
+        }
+
+        await interaction.editReply({
+            content: `Deine Bewerbung als Arbeiter für ${employer.user.tag} wurde eingereicht! Warte auf die Bestätigung.`
+        });
+    } catch (error) {
+        console.error('Fehler beim Einreichen der Bewerbung:', error);
+        await interaction.editReply({
+            content: 'Es ist ein Fehler beim Einreichen der Bewerbung aufgetreten!'
+        });
+    }
+});
+
+// Im Button Interaction Handler für die Arbeiter-Aktionen
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('accept_worker_') && !customId.startsWith('reject_worker_') && !customId.startsWith('remove_worker_')) return;
+
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+    const [action, _, workerId, roleId, employerId] = customId.split('_');
+    const worker = await guild.members.fetch(workerId).catch(() => null);
+    const role = guild.roles.cache.get(roleId);
+    const employer = employerId ? await guild.members.fetch(employerId).catch(() => null) : null;
+
+    if (!worker || !role) {
+        await interaction.reply({
+            content: 'Der Arbeiter oder die Rolle wurde nicht gefunden!',
+            flags: 64
+        });
+        return;
+    }
+
+    // Prüfe Berechtigungen
+    const member = interaction.member as GuildMember;
+    const hasPermission = member.permissions.has(PermissionFlagsBits.Administrator) ||
+        (serverConfig.commandRoles && member.roles.cache.some(role => 
+            serverConfig.commandRoles!.includes(role.id)
+        ));
+
+    if (!hasPermission) {
+        await interaction.reply({
+            content: 'Du hast keine Berechtigung für diese Aktion!',
+            flags: 64
+        });
+        return;
+    }
+
+    try {
+        if (action === 'accept') {
+            // Zeige das Passwort-Modal
+            const modal = new ModalBuilder()
+                .setCustomId(`worker_password_modal_${workerId}_${roleId}_${employerId}`)
+                .setTitle('Arbeiter-Passwort festlegen');
+
+            const passwordInput = new TextInputBuilder()
+                .setCustomId('password')
+                .setLabel('Passwort für den Arbeiter')
+                .setPlaceholder('Gib ein Passwort ein, das dem Arbeiter mitgeteilt wird')
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true);
+
+            const firstActionRow = new ActionRowBuilder<TextInputBuilder>().addComponents(passwordInput);
+            modal.addComponents(firstActionRow);
+
+            await interaction.showModal(modal);
+            return;
+        } else if (action === 'reject') {
+            // Entferne die Bewerbung aus den ausstehenden Bewerbungen
+            if (serverConfig.pendingWorkerApplications) {
+                serverConfig.pendingWorkerApplications = serverConfig.pendingWorkerApplications.filter(
+                    app => app.workerId !== worker.id
+                );
+                saveDatabase(database);
+            }
+
+            // Logge die Ablehnung
+            if (serverConfig.roleAssignmentLogChannelId) {
+                const logChannel = guild.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+                if (logChannel) {
+                    const logEmbed = new EmbedBuilder()
+                        .setTitle('❌ Arbeiter abgelehnt')
+                        .setDescription(`${worker.user.tag} wurde als Arbeiter abgelehnt`)
+                        .addFields(
+                            { name: 'Bewerber', value: worker.user.tag },
+                            { name: 'Chef', value: employer?.user.tag || 'Unbekannt' },
+                            { name: 'Abgelehnt von', value: interaction.user.tag },
+                            { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                        )
+                        .setColor('#ff0000')
+                        .setTimestamp();
+
+                    await logChannel.send({ embeds: [logEmbed] });
+                }
+            }
+
+            // Benachrichtige den Bewerber
+            await worker.send(`Deine Bewerbung als Arbeiter bei ${employer?.user.tag || 'einem Administrator'} wurde abgelehnt.`).catch(() => {});
+
+            await interaction.reply({
+                content: `${worker.user.tag} wurde als Arbeiter abgelehnt.`,
+                flags: 64
+            });
+        } else if (action === 'remove') {
+            // Prüfe nur noch auf allgemeine Berechtigungen
+            if (!hasPermission) {
+                await interaction.reply({
+                    content: 'Du hast keine Berechtigung für diese Aktion!',
+                    flags: 64
+                });
+                return;
+            }
+
+            // Entferne die Rolle
+            await worker.roles.remove(role);
+            
+            // Entferne die Rolle aus der Datenbank
+            serverConfig.userRoles = serverConfig.userRoles.filter(ur => ur.userId !== worker.id);
+            saveDatabase(database);
+
+            // Aktualisiere den Passwort-Kanal
+            await updatePasswordChannel(guild, serverConfig);
+
+            // Erstelle die neue Informationsnachricht
+            const removedEmbed = createWorkerRemovedEmbed(worker, employer, interaction.member as GuildMember);
+
+            // Bearbeite die ursprüngliche Nachricht
+            if (interaction.message) {
+                await interaction.message.edit({
+                    embeds: [removedEmbed],
+                    components: [] // Entferne die Buttons
+                });
+            }
+
+            // Logge das Entfernen der Rolle
+            if (serverConfig.roleAssignmentLogChannelId) {
+                const logChannel = guild.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+                if (logChannel) {
+                    const logEmbed = new EmbedBuilder()
+                        .setTitle('👋 Arbeiter entlassen')
+                        .setDescription(`${worker.user.tag} wurde als Arbeiter entlassen`)
+                        .addFields(
+                            { name: 'Arbeiter', value: worker.user.tag },
+                            { name: 'Chef', value: employer?.user.tag || 'Unbekannt' },
+                            { name: 'Entlassen von', value: interaction.user.tag },
+                            { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                        )
+                        .setColor('#ff9900')
+                        .setTimestamp();
+
+                    await logChannel.send({ embeds: [logEmbed] });
+                }
+            }
+
+            // Benachrichtige den Arbeiter
+            await worker.send(`Du wurdest von ${interaction.user.tag} als Arbeiter entlassen.`).catch(() => {});
+
+            // Benachrichtige den ursprünglichen Chef (falls es nicht der Chef selbst war)
+            if (employer && employer.id !== member.id) {
+                await employer.send(`${worker.user.tag} wurde von ${interaction.user.tag} als dein Arbeiter entlassen.`).catch(() => {});
+            }
+
+            await interaction.reply({
+                content: `${worker.user.tag} wurde als Arbeiter entlassen.`,
+                flags: 64
+            });
+        }
+
+        // Deaktiviere die Buttons nach der Aktion
+        const message = interaction.message;
+        const firstRow = message.components[0];
+        if (firstRow && 'components' in firstRow) {
+            const newRow = new ActionRowBuilder<ButtonBuilder>()
+                .addComponents(
+                    firstRow.components.map((button: any) => 
+                        ButtonBuilder.from(button.data)
+                            .setDisabled(true)
+                    )
+                );
+
+            await message.edit({ components: [newRow] });
+        }
+    } catch (error) {
+        console.error('Fehler bei der Arbeiter-Aktion:', error);
+        await interaction.reply({
+            content: 'Es ist ein Fehler bei der Aktion aufgetreten!',
+            flags: 64
+        });
+    }
+});
+
+// Füge einen neuen Modal Submit Handler für das Passwort hinzu
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('worker_password_modal_')) return;
+
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    // Sofortige Antwort auf die Interaktion
+    await interaction.deferReply({ ephemeral: true });
+
+    const serverConfig = getServerConfig(guild.id);
+    const [_, __, ___, workerId, roleId, employerId] = customId.split('_');
+    const worker = await guild.members.fetch(workerId).catch(() => null);
+    const role = guild.roles.cache.get(roleId);
+    const employer = employerId ? await guild.members.fetch(employerId).catch(() => null) : null;
+
+    if (!worker || !role) {
+        await interaction.editReply({
+            content: 'Der Arbeiter oder die Rolle wurde nicht gefunden!'
+        });
+        return;
+    }
+
+    try {
+        const password = interaction.fields.getTextInputValue('password');
+
+        // Füge die Rolle hinzu
+        await worker.roles.add(role);
+        
+        // Speichere die Rolle und das Passwort in der Datenbank
+        serverConfig.userRoles.push({
+            userId: worker.id,
+            roleId: role.id,
+            assignedAt: new Date().toISOString(),
+            employerId: employerId,
+            password: password // Speichere das Passwort
+        });
+        saveDatabase(database);
+
+        // Entferne die Bewerbung aus den ausstehenden Bewerbungen
+        if (serverConfig.pendingWorkerApplications) {
+            serverConfig.pendingWorkerApplications = serverConfig.pendingWorkerApplications.filter(
+                app => app.workerId !== worker.id
+            );
+            saveDatabase(database);
+        }
+
+        // Erstelle die neue Informationsnachricht
+        const infoEmbed = new EmbedBuilder()
+            .setTitle('👷 Arbeiter-Informationen')
+            .setDescription(`<@${worker.id}> ist jetzt ein Arbeiter`)
+            .addFields(
+                { name: 'Chef', value: employer ? `<@${employer.id}>` : 'Unbekannt' },
+                { name: 'Angenommen von', value: `<@${interaction.user.id}>` },
+                { name: 'Angenommen am', value: new Date().toLocaleString('de-DE') }
+            )
+            .setColor('#00ff00')
+            .setTimestamp();
+
+        const removeButton = new ButtonBuilder()
+            .setCustomId(`remove_worker_${workerId}_${roleId}_${employerId}`)
+            .setLabel('Arbeiter entlassen')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('👋');
+
+        const row = new ActionRowBuilder<ButtonBuilder>()
+            .addComponents(removeButton);
+
+        // Bearbeite die ursprüngliche Nachricht
+        if (interaction.message) {
+            await interaction.message.edit({
+                embeds: [infoEmbed],
+                components: [row]
+            });
+        }
+
+        // Logge die erfolgreiche Rollenvergabe
+        if (serverConfig.roleAssignmentLogChannelId) {
+            const logChannel = guild.channels.cache.get(serverConfig.roleAssignmentLogChannelId) as TextChannel;
+            if (logChannel) {
+                const logEmbed = new EmbedBuilder()
+                    .setTitle('✅ Arbeiter angenommen')
+                    .setDescription(`<@${worker.id}> wurde als Arbeiter angenommen`)
+                    .addFields(
+                        { name: 'Arbeiter', value: `<@${worker.id}>` },
+                        { name: 'Chef', value: employer ? `<@${employer.id}>` : 'Unbekannt' },
+                        { name: 'Angenommen von', value: `<@${interaction.user.id}>` },
+                        { name: 'Zeitpunkt', value: new Date().toLocaleString('de-DE') }
+                    )
+                    .setColor('#00ff00')
+                    .setTimestamp();
+
+                await logChannel.send({ embeds: [logEmbed] });
+            }
+        }
+
+        // Benachrichtige den Arbeiter mit dem Passwort
+        await worker.send(`Du wurdest als Arbeiter von ${employer?.user.tag || 'einem Administrator'} angenommen!\nDein Passwort lautet: ${password}`).catch(() => {});
+
+        // Benachrichtige den ursprünglichen Chef
+        if (employer) {
+            await employer.send(`${worker.user.tag} wurde als dein Arbeiter angenommen.`).catch(() => {});
+        }
+
+        // Aktualisiere den Passwort-Kanal
+        if (serverConfig.workerPasswordChannelId) {
+            const passwordChannel = guild.channels.cache.get(serverConfig.workerPasswordChannelId) as TextChannel;
+            if (passwordChannel) {
+                // Hole alle Arbeiter mit Passwörtern
+                const workersWithPasswords = serverConfig.userRoles
+                    .filter(ur => ur.roleId === role.id && ur.employerId)
+                    .map(async ur => {
+                        const workerMember = await guild.members.fetch(ur.userId).catch(() => null);
+                        const employerMember = await guild.members.fetch(ur.employerId!).catch(() => null);
+                        return {
+                            worker: workerMember,
+                            employer: employerMember,
+                            assignedAt: ur.assignedAt
+                        };
+                    });
+
+                const workers = await Promise.all(workersWithPasswords);
+
+                const passwordEmbed = new EmbedBuilder()
+                    .setTitle('🔑 Arbeiter-Passwörter')
+                    .setDescription('Hier sind alle Arbeiter und ihre Passwörter:')
+                    .addFields(
+                        {
+                            name: 'Arbeiter',
+                            value: workers.map((w, index) => {
+                                const workerRole = serverConfig.userRoles.find(ur => ur.userId === w.worker?.id);
+                                return `${w.worker?.displayName || 'Unbekannt'}: ${workerRole?.password || 'Kein Passwort gesetzt'}`;
+                            }).join('\n'),
+                            inline: false
+                        }
+                    )
+                    .setColor('#FFA500')
+                    .setTimestamp();
+
+                    // Lösche alte Nachrichten
+                    const messages = await passwordChannel.messages.fetch({ limit: 10 });
+                    await Promise.all(messages.map(msg => msg.delete()));
+
+                    await passwordChannel.send({ embeds: [passwordEmbed] });
+            }
+        }
+
+        await interaction.editReply({
+            content: `${worker.user.tag} wurde als Arbeiter angenommen!`
+        });
+    } catch (error) {
+        console.error('Fehler bei der Arbeiter-Aktion:', error);
+        await interaction.editReply({
+            content: 'Es ist ein Fehler bei der Aktion aufgetreten!'
+        });
+    }
+});
+
+// Im Button Interaction Handler
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+
+    const customId = interaction.customId;
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+
+    // Routen-Kontrolle Button
+    if (customId.startsWith('route_control_')) {
+        const roleId = customId.replace('route_control_', '');
+        const { createControlModal } = await import('./routeControl');
+        
+        const modal = createControlModal(roleId);
+        await interaction.showModal(modal);
+        return;
+    }
+
+    // Allgemeine Routen-Kontrolle Button
+    if (customId === 'route_control_all') {
+        const { createControlModal } = await import('./routeControl');
+        
+        const modal = createControlModal('all');
+        await interaction.showModal(modal);
+        return;
+    }
+
+    // Routen-Wache Buttons
+    if (customId === 'route_watch_start') {
+        const channel = interaction.channel as TextChannel;
+        const { createPartnerModal } = await import('./routeControl');
+        
+        const modal = createPartnerModal();
+        await interaction.showModal(modal);
+        return;
+    }
+
+    if (customId === 'route_watch_stop') {
+        const channel = interaction.channel as TextChannel;
+        const { stopRouteWatch } = await import('./routeControl');
+        
+        await stopRouteWatch(channel, serverConfig);
+        await interaction.reply({
+            content: 'Die Routen-Wache wurde gestoppt!',
+            ephemeral: true
+        });
+        return;
+    }
+});
+
+// Modal Submit Handler für die Routen-Kontrolle
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+
+    const customId = interaction.customId;
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+
+    if (customId === 'route_watch_partner_modal') {
+        const channel = interaction.channel as TextChannel;
+        const { startRouteWatch, findPartners } = await import('./routeControl');
+        
+        const partnerInput = interaction.fields.getTextInputValue('partner');
+        const { found, notFound } = findPartners(channel.guild, partnerInput);
+        
+        let responseMessage = 'Die Routen-Wache wurde gestartet!';
+        if (found.length > 0) {
+            responseMessage += `\nGefundene Partner: ${found.map(m => m.user.tag).join(', ')}`;
+        }
+        if (notFound.length > 0) {
+            responseMessage += `\nNicht gefundene Partner: ${notFound.join(', ')}`;
+        }
+        
+        await startRouteWatch(channel, serverConfig, partnerInput);
+        await interaction.reply({
+            content: responseMessage,
+            ephemeral: true
+        });
+        return;
+    }
+
+    if (!customId.startsWith('route_control_modal_')) return;
+
+    const roleId = customId.replace('route_control_modal_', '');
+    
+    // Spezialfall für die allgemeine Routen-Kontrolle ("all")
+    if (roleId !== 'all') {
+        const familyData = serverConfig.familyChannels[roleId];
+        if (!familyData) {
+            await interaction.reply({
+                content: 'Diese Familie wurde nicht gefunden!',
+                ephemeral: true
+            });
+            return;
+        }
+    }
+
+    const partnerInput = interaction.fields.getTextInputValue('partner');
+    const controlPoints = interaction.fields.getTextInputValue('control_points');
+    const notes = interaction.fields.getTextInputValue('notes');
+
+    const { findPartners, logRouteControl } = await import('./routeControl');
+    const { found, notFound } = findPartners(guild, partnerInput);
+
+    // Erstelle die Log-Details
+    let details = `Kontrolleur: ${interaction.user.tag}\n`;
+    
+    if (found.length > 0) {
+        details += `Kontrollpartner: ${found.map(m => m.user.tag).join(', ')}\n`;
+    }
+    if (notFound.length > 0) {
+        details += `Nicht gefundene Partner: ${notFound.join(', ')}\n`;
+    }
+
+    details += `Kontrollpunkte: ${controlPoints}\n`;
+    
+    if (notes) {
+        details += `Auffälligkeiten: ${notes}`;
+    }
+
+    // Logge die Kontrolle
+    await logRouteControl(
+        guild,
+        serverConfig,
+        interaction.member as GuildMember,
+        roleId === 'all' ? 'Allgemein' : roleId, // Verwende 'Allgemein' für die allgemeine Routen-Kontrolle
+        '✅ Routen-Kontrolle durchgeführt',
+        details
+    );
+
+    await interaction.reply({
+        content: '✅ Die Routen-Kontrolle wurde erfolgreich protokolliert!',
+        ephemeral: true
+    });
+});
+
+// Neuer Handler für das StringSelectMenu (Checkboxen)
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isStringSelectMenu()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('control_points_select_')) return;
+
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+    const roleId = customId.replace('control_points_select_', '');
+    const selectedOptions = interaction.values;
+    
+    // Hole die versteckten Daten aus dem Interaction State
+    // Da wir die Daten nicht direkt im Select-Menü speichern können,
+    // müssen wir sie temporär speichern und hier wieder abrufen
+    // Das geht in Discord.js nicht direkt, deswegen fordern wir die Daten erneut an
+
+    await interaction.deferReply({ ephemeral: true });
+
+    // Finde die Original-Nachricht und extrahiere die Daten
+    const message = interaction.message;
+    const channel = interaction.channel as TextChannel;
+
+    // Fordern wir den Benutzer auf, weitere Informationen einzugeben
+    const modal = new ModalBuilder()
+        .setCustomId(`control_points_details_${roleId}_${selectedOptions.join('_')}`)
+        .setTitle('Routenkontrolle - Details');
+
+    const partnerInput = new TextInputBuilder()
+        .setCustomId('partner')
+        .setLabel('Mit wem wurde kontrolliert?')
+        .setPlaceholder('Gib die Namen deiner Kontrollpartner ein (durch Komma getrennt)')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true);
+
+    const notesInput = new TextInputBuilder()
+        .setCustomId('notes')
+        .setLabel('Auffälligkeiten')
+        .setPlaceholder('Füge hier Auffälligkeiten oder Notizen zur Kontrolle hinzu (optional)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false);
+
+    const firstActionRow = new ActionRowBuilder<TextInputBuilder>().addComponents(partnerInput);
+    const secondActionRow = new ActionRowBuilder<TextInputBuilder>().addComponents(notesInput);
+    
+    modal.addComponents(firstActionRow, secondActionRow);
+
+    await interaction.showModal(modal);
+});
+
+// Handler für den Modal-Submit für die Kontrollpunkte-Details
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isModalSubmit()) return;
+
+    const customId = interaction.customId;
+    if (!customId.startsWith('control_points_details_')) return;
+
+    const guild = interaction.guild;
+    if (!guild) return;
+
+    const serverConfig = getServerConfig(guild.id);
+    
+    // Extrahiere Informationen aus der Custom ID
+    const parts = customId.replace('control_points_details_', '').split('_');
+    const roleId = parts[0];
+    const selectedOptions = parts.slice(1);
+    
+    const partnerInput = interaction.fields.getTextInputValue('partner');
+    const notes = interaction.fields.getTextInputValue('notes');
+
+    const { findPartners, logRouteControl } = await import('./routeControl');
+    const { found, notFound } = findPartners(guild, partnerInput);
+
+    // Erstelle die Log-Details
+    let details = `Passwort: Eingegeben\n`; // Nicht mehr überprüfen, ob korrekt
+    details += `Kontrolleur: ${interaction.user.tag}\n`;
+    
+    if (found.length > 0) {
+        details += `Kontrollpartner: ${found.map(m => m.user.tag).join(', ')}\n`;
+    }
+    if (notFound.length > 0) {
+        details += `Nicht gefundene Partner: ${notFound.join(', ')}\n`;
+    }
+
+    // Formatiere die ausgewählten Kontrollpunkte
+    const controlPointsFormatted = selectedOptions.map(option => {
+        switch (option) {
+            case 'sammler': return '🔨 Sammler';
+            case 'verarbeiter': return '⚒️ Verarbeiter';
+            case 'verkäufer': return '💰 Verkäufer';
+            default: return option;
+        }
+    }).join(', ');
+
+    details += `Kontrollpunkte: ${controlPointsFormatted}\n`;
+    
+    if (notes) {
+        details += `Auffälligkeiten: ${notes}`;
+    }
+
+    // Logge die Kontrolle
+    await logRouteControl(
+        guild,
+        serverConfig,
+        interaction.member as GuildMember,
+        roleId,
+        '✅ Routen-Kontrolle durchgeführt',
+        details
+    );
+
+    await interaction.reply({
+        content: `✅ Die Routen-Kontrolle wurde erfolgreich protokolliert!\nKontrollierte Punkte: ${controlPointsFormatted}`,
+        ephemeral: true
+    });
 });
 
 client.login(process.env.TOKEN); 

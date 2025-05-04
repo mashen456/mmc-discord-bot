@@ -3,106 +3,18 @@
     "1368371029474541569": {
       "guildId": "1368371029474541569",
       "reactionRoles": {
-        "<:MalvadosNoBG:1368410990743650334>": "1368411079704580107"
+        "👷": "1368586870392488036"
       },
-      "userRoles": [
-        {
-          "userId": "1045990804180713543",
-          "roleId": "1368411079704580107",
-          "assignedAt": "2025-05-04T02:18:28.309Z"
-        }
-      ],
-      "familyChannels": {
-        "1368411079704580107": {
-          "categoryId": "1368411080816066582",
-          "timeChannelId": "1368411082292723763",
-          "commChannelId": "1368411084226297896",
-          "passwordChannelId": "1368411091138379857"
-        }
-      },
-      "roleSelectionMessageId": "1368411029477785694",
-      "roleSelectionChannelId": "1368371029474541572"
-    },
-    "1368295669743353856": {
-      "guildId": "1368295669743353856",
-      "reactionRoles": {
-        "<:MalvadosNoBG:1368407993519046736>": "1368411616248594432",
-        "🧑🏿‍🏭": "1368412433378443344"
-      },
-      "userRoles": [
-        {
-          "userId": "1045990804180713543",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:19:33.111Z"
-        },
-        {
-          "userId": "858375192014487572",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:20:28.571Z"
-        },
-        {
-          "userId": "449553113372819466",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:20:40.158Z"
-        },
-        {
-          "userId": "851129567896403988",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:20:43.337Z"
-        },
-        {
-          "userId": "705491340984582184",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:28:21.175Z"
-        },
-        {
-          "userId": "714243523624304660",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:30:29.935Z"
-        },
-        {
-          "userId": "331071620183621635",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:30:33.101Z"
-        },
-        {
-          "userId": "406137283960635393",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:30:37.442Z"
-        },
-        {
-          "userId": "1207052350519246918",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:30:44.493Z"
-        },
-        {
-          "userId": "661352744992636928",
-          "roleId": "1368411616248594432",
-          "assignedAt": "2025-05-04T02:31:58.445Z"
-        }
-      ],
-      "familyChannels": {
-        "1368411616248594432": {
-          "categoryId": "1368411617410285660",
-          "timeChannelId": "1368411618282573838",
-          "commChannelId": "1368411620006432910",
-          "passwordChannelId": "1368411621277433867"
-        },
-        "1368412433378443344": {
-          "categoryId": "1368412434628349982",
-          "timeChannelId": "1368412435677184031",
-          "commChannelId": "1368412436402536512",
-          "passwordChannelId": "1368412438130589736"
-        }
-      },
-      "roleSelectionMessageId": "1368411565304320010",
-      "roleSelectionChannelId": "1368295670468972728",
-      "infoChannels": [
-        "1368302228774850610"
-      ],
-      "roleAssignmentLogChannelId": "1368367275815473241",
-      "roleErrorLogChannelId": "1368401995115008063",
-      "rejoinLogChannelId": "1368402109967630376"
+      "userRoles": [],
+      "familyChannels": {},
+      "roleSelectionMessageId": "1368600092528869558",
+      "roleSelectionChannelId": "1368371029474541572",
+      "workerInfoChannelId": "1368600069351145534",
+      "pendingWorkerApplications": [],
+      "workerPasswordChannelId": "1368587257631604839",
+      "routeControlChannelId": "1368614639767912458",
+      "routeControlMessageId": "1368614732612763801",
+      "routeControlLogChannelId": "1368614663817924708"
     }
   }
 }
