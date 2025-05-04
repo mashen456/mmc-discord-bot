@@ -21,7 +21,7 @@ RUN mkdir -p /app/data
 
 # Setze Umgebungsvariablen
 ENV NODE_ENV=production
-ENV DATABASE_PATH=/app/data/database.json
+ENV DB_PATH=/app/data/database.json
 
 # Starte den Bot
 CMD ["npm", "start"] 

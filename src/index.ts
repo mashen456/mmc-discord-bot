@@ -60,7 +60,7 @@ interface Database {
 }
 
 // Datenbank-Funktionen
-const DB_PATH = path.join(__dirname, 'database.json');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'database.json');
 
 function loadDatabase(): Database {
     try {
